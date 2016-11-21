@@ -142,6 +142,12 @@ public class TestSwiftFileSystemDirectories extends SwiftFileSystemBaseTest {
   @Test(timeout = SWIFT_TEST_TIMEOUT)
   public void testMultiByteFilesAreFiles() throws Exception {
     Path src = path("/test/testMultiByteFilesAreFiles");
+    try {
+    	fs.delete(src);
+    }
+    catch (Exception e) {
+    	// ignored
+    }
     SwiftTestUtils.writeTextFile(fs, src, "testMultiByteFilesAreFiles", false);
     assertIsFile(src);
     FileStatus status = fs.getFileStatus(src);

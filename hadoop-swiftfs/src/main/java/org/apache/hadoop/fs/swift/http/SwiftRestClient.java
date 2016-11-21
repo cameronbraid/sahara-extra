@@ -41,6 +41,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.swift.auth.ApiKeyAuthenticationRequest;
 import org.apache.hadoop.fs.swift.auth.ApiKeyCredentials;
 import org.apache.hadoop.fs.swift.auth.AuthenticationRequest;
+import org.apache.hadoop.fs.swift.auth.AuthenticationRequestV1;
 import org.apache.hadoop.fs.swift.auth.AuthenticationRequestV2;
 import org.apache.hadoop.fs.swift.auth.AuthenticationRequestV3;
 import org.apache.hadoop.fs.swift.auth.AuthenticationRequestWrapper;
@@ -192,6 +193,8 @@ public final class SwiftRestClient {
    */
   private URI endpointURI;
 
+  private boolean isV1;
+  
   /**
    * URI under which objects can be found.
    * This is set when the user is authenticated -the URI
@@ -379,6 +382,20 @@ public final class SwiftRestClient {
     }
   }
 
+
+  /**
+   * There's a special type for auth messages, so that low-level
+   * message handlers can react to auth failures differently from everything
+   * else.
+   */
+  private static class AuthGetMethod extends GetMethod {
+
+
+    private AuthGetMethod(String uri) {
+      super(uri);
+    }
+  }
+
   /**
    * There's a special type for auth messages, so that low-level
    * message handlers can react to auth failures differently from everything
@@ -392,11 +409,19 @@ public final class SwiftRestClient {
     }
   }
 
+  private static abstract class AuthGetMethodProcessor<R> extends
+  HttpMethodProcessor<AuthGetMethod, R> {
+@Override
+protected final AuthGetMethod doCreateMethod(String uri) {
+return new AuthGetMethod(uri);
+}
+}
+
   /**
    * Generate an auth message
    * @param <R> response
    */
-  private static abstract class AuthMethodProcessor<R> extends
+  private static abstract class AuthPostMethodProcessor<R> extends
                                                        HttpMethodProcessor<AuthPostMethod, R> {
     @Override
     protected final AuthPostMethod doCreateMethod(String uri) {
@@ -512,6 +537,7 @@ public final class SwiftRestClient {
     String isPubProp = props.getProperty(SWIFT_PUBLIC_PROPERTY, "false");
     usePublicURL = "true".equals(isPubProp);
     authEndpointPrefix = getOption(props, SWIFT_AUTH_ENDPOINT_PREFIX);
+    isV1 = stringAuthUri.contains("/v1.0");
     boolean isV3 = stringAuthUri.contains("/v3/auth/tokens");
 
     if (apiKey == null && password == null) {
@@ -521,31 +547,37 @@ public final class SwiftRestClient {
                   + SWIFT_APIKEY_PROPERTY);
     }
     //create the (reusable) authentication request
-    if (isV3) {
-      if (trust_id == null) {
-        if (password != null) {
-          authRequest = new PasswordAuthenticationRequestV3(tenant,
-                  new PasswordCredentialsV3(username, password, domain_name,
-                      domain_id));
-        } else {
-          authRequest = new TokenAuthenticationRequestV3(apiKey);
-        }
-      } else {
-        authRequest = new TrustAuthenticationRequest(
-                new PasswordCredentialsV3(username, password, domain_name,
-                    domain_id),
-                trust_id);
-      }
-    } else {
-      if (password != null) {
-        authRequest = new PasswordAuthenticationRequest(tenant,
-                new PasswordCredentials(username, password));
-      } else {
-        authRequest = new ApiKeyAuthenticationRequest(tenant,
-                new ApiKeyCredentials(username, apiKey));
-        keystoneAuthRequest = new KeyStoneAuthRequest(tenant,
-                new KeystoneApiKeyCredentials(username, apiKey));
-      }
+    if (isV1) {
+    	useKeystoneAuthentication = false;
+        authRequest = new AuthenticationRequestV1(new ApiKeyCredentials(username, apiKey));
+    }
+    else {
+	    if (isV3) {
+	      if (trust_id == null) {
+	        if (password != null) {
+	          authRequest = new PasswordAuthenticationRequestV3(tenant,
+	                  new PasswordCredentialsV3(username, password, domain_name,
+	                      domain_id));
+	        } else {
+	          authRequest = new TokenAuthenticationRequestV3(apiKey);
+	        }
+	      } else {
+	        authRequest = new TrustAuthenticationRequest(
+	                new PasswordCredentialsV3(username, password, domain_name,
+	                    domain_id),
+	                trust_id);
+	      }
+	    } else {
+	      if (password != null) {
+	        authRequest = new PasswordAuthenticationRequest(tenant,
+	                new PasswordCredentials(username, password));
+	      } else {
+	        authRequest = new ApiKeyAuthenticationRequest(tenant,
+	                new ApiKeyCredentials(username, apiKey));
+	        keystoneAuthRequest = new KeyStoneAuthRequest(tenant,
+	                new KeystoneApiKeyCredentials(username, apiKey));
+	      }
+	    }
     }
     locationAware = "true".equals(
       props.getProperty(SWIFT_LOCATION_AWARE_PROPERTY, "false"));
@@ -1181,10 +1213,58 @@ public final class SwiftRestClient {
     LOG.debug("started authentication");
     return perform("authentication",
                    authUri,
-                   new AuthenticationPost(authenticationRequest));
+                   isV1 ? new AuthenticationGet(authenticationRequest) : new AuthenticationPost(authenticationRequest));
   }
 
-  private class AuthenticationPost extends AuthMethodProcessor<AccessToken> {
+  private class AuthenticationGet extends AuthGetMethodProcessor<AccessToken> {
+	    final AuthenticationRequest authenticationRequest;
+
+	    private AuthenticationGet(AuthenticationRequest authenticationRequest) {
+	      this.authenticationRequest = authenticationRequest;
+	    }
+
+	    @Override
+	    protected void setup(AuthGetMethod method) throws IOException {
+	    	AuthenticationRequestV1 r = (AuthenticationRequestV1)authenticationRequest;
+	    	method.addRequestHeader("X-Auth-User", r.getApiKeyCredentials().getUsername());
+	    	method.addRequestHeader("X-Auth-Key", r.getApiKeyCredentials().getApiKey());
+	    }
+
+	    /**
+	     * specification says any of the 2xxs are OK, so list all
+	     * the standard ones
+	     * @return a set of 2XX status codes.
+	     */
+	    @Override
+	    protected int[] getAllowedStatusCodes() {
+	      return new int[]{
+	        SC_OK,
+	        SC_BAD_REQUEST,
+	        SC_CREATED,
+	        SC_ACCEPTED,
+	        SC_NON_AUTHORITATIVE_INFORMATION,
+	        SC_NO_CONTENT,
+	        SC_RESET_CONTENT,
+	        SC_PARTIAL_CONTENT,
+	        SC_MULTI_STATUS,
+	        SC_UNAUTHORIZED //if request unauthorized, try another method
+	      };
+	    }
+	    @Override
+	    public AccessToken extractResult(AuthGetMethod method) throws IOException {
+	    	
+	    	AccessToken token = new AccessToken();
+	    	token.setExpires(method.getResponseHeader("X-Auth-Token-Expires").getValue());
+	    	token.setId(method.getResponseHeader("X-Auth-Token").getValue());
+
+	    	URI uri = URI.create(method.getResponseHeader("X-Storage-Url").getValue());
+	    	setAuthDetails(uri, uri, token);
+	    	return token;
+	    }
+  }
+
+	    
+  private class AuthenticationPost extends AuthPostMethodProcessor<AccessToken> {
     final AuthenticationRequest authenticationRequest;
 
     private AuthenticationPost(AuthenticationRequest authenticationRequest) {
@@ -1898,7 +1978,7 @@ public final class SwiftRestClient {
     if (statusCode == HttpStatus.SC_UNAUTHORIZED ) {
       //unauthed -or the auth uri rejected it.
 
-      if (method instanceof AuthPostMethod) {
+      if (method instanceof AuthPostMethod || method instanceof AuthGetMethod) {
           //unauth response from the AUTH URI itself.
           throw new SwiftAuthenticationFailedException(authRequest.toString(),
                                                        "auth",
