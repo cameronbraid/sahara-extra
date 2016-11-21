@@ -1,2 +1,5 @@
 /bin/
 src/test/resources/auth-keys.xml
+.classpath
+.project
+.settings
